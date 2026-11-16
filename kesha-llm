@@ -84,6 +84,8 @@ CATALOG = {
                   HF + "LiquidAI/LFM2-350M-GGUF/resolve/main/LFM2-350M-Q4_K_M.gguf"),
     "qwen2.5-coder-0.5b": ("Best coder, but slow (leave it thinking).", 469,
                            HF + "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"),
+    "qwen3-0.6b": ("Newer, reasons before answering. Chat.", 378,
+                   HF + "unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"),
     "yolox-nano": ("Vision. Built in, fastest.", 4, YOLOX + "yolox_nano.onnx"),
     "yolox-tiny": ("Vision. Sharper, slower.", 19, YOLOX + "yolox_tiny.onnx"),
 }
