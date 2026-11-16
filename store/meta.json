@@ -1,6 +1,6 @@
 {
   "title": "Kesha Code LLM",
-  "summary": "Tiny local AI that writes and runs scripts, plus chat and live camera recognition",
+  "summary": "On-device LLM that writes & runs scripts, with chat and camera recognition",
   "description": "Kesha Code LLM runs small language models fully on the Cardputer Zero with llama.cpp. Code: projects with a file manager, a small sh/Python editor and a console, where a local model writes, names and edits scripts for you from the project chat, using built-in skills for common tasks (wifi, web server, Python snippets, battery and more). The Code top bar shows the model in use and the battery. Choose the model per task: a 90M for speed, a 350M for better code, or a 0.5B coder to leave thinking. Power mode frees RAM for the bigger models (it lowers gpu_mem and turns off the camera; reversible, needs a restart). Chat: talk to a model offline. Vision: live object detection with boxes and percentages, text recognition, photos and annotated video. Models: download, switch and delete models, or drop in your own .gguf / .onnx files. No account, no cloud.",
   "categories": [
     "AI",
@@ -26,8 +26,6 @@
   "screenshots": [
     "screenshots/screenshot-0.png",
     "screenshots/screenshot-1.png",
-    "screenshots/screenshot-2.png",
-    "screenshots/screenshot-3.png",
-    "screenshots/screenshot-4.png"
+    "screenshots/screenshot-2.png"
   ]
 }
