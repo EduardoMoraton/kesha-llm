@@ -1,0 +1,1503 @@
+#!/usr/bin/env python3
+"""Kesha Code LLM - tiny local AI for the M5Stack Cardputer Zero (320x170 LCD, keyboard only).
+
+Chat with small GGUF models through a bundled llama.cpp `llama-server`, manage those models,
+and run live camera object detection (YOLOX-nano via OpenCV) with OCR (tesseract).
+"""
+import atexit, functools, hashlib, importlib.util, json, os, re, shutil, signal, struct, subprocess, sys, threading, time, urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "vendor"))  # bundled onnxruntime
+LLAMA = Path(os.environ.get("KESHA_LLAMA_DIR", HERE / "llama"))
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "kesha-llm"
+MODELS = DATA / "models"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "kesha-llm.json"
+LOG = DATA / "server.log"
+URL = "http://127.0.0.1:9931"
+HF = "https://huggingface.co/"
+CODE_ROOT = Path.home() / "kesha-code"   # one folder per Code session
+YOLOX = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/"
+SYSTEM = ("You are Kesha, a tiny offline assistant running on a Cardputer Zero. "
+          "Answer briefly, in the user's language.")
+
+# Tiny models follow examples far better than instructions, so the Code chat is a few-shot prompt: each turn is
+# "Hints (commands picked from the project's .context notes) + optional script to change + Task", answered by
+# exactly one code block whose first line is a comment with the file name the model chose. Keeping the name of
+# the script it was shown means "edit that file". (A name on its own line above the block was tried: the small
+# models skip it or break the fence.)
+CODE_SYSTEM = ("You are a coding engine for a Linux pocket computer. Output ONLY one fenced code block and "
+               "nothing else: no prose, no explanation, nothing before or after the block. The first line inside "
+               "is a comment with the file name. Write no other comments. Make the script complete and correct, "
+               "doing exactly what the user asks and nothing more.")
+CODE_SHOTS = [("Hints:\n# uptime\nuptime\n\nTask: show how long the device has been on", "```sh\n# uptime.sh\nuptime\n```"),
+              ("Task: python script that says hello 3 times",
+               '```python\n# hello.py\nfor i in range(3):\n    print("hello")\n```'),
+              ('```python\n# hello.py\nfor i in range(3):\n    print("hello")\n```\n\nTask: make it say bye 5 times',
+               '```python\n# hello.py\nfor i in range(5):\n    print("bye")\n```'),
+              ("Hints:\n# ping the internet\nping -c 3 1.1.1.1\n\nTask: ping google 4 times and save it to out.txt",
+               "```sh\n# ping.sh\nping -c 4 google.com > out.txt\n```"),  # adapt the hint: change count, target, redirect
+              ("Hints:\n# serve the current folder on the web\npython3 -m http.server 8080\n\n"
+               "Task: start a web page that shows a hello message",
+               "```sh\n# web.sh\necho 'Hello from the Cardputer' > index.html\npython3 -m http.server 8080\n```"),
+              ("Hints:\n# strongest wifi nearby\nnmcli -f SIGNAL,SSID dev wifi | sort -rn | head -n1\n\n"
+               "Task: show the closest wifi network",
+               "```sh\n# wifi.sh\nnmcli -f SIGNAL,SSID dev wifi | sort -rn | head -n1\n```")]
+# Built-in skills: ready-made one-line recipes the model can reuse. Matched to the task by label (see hints()),
+# so even a brand-new project has good building blocks. Same "label: command" format as the .context notes.
+SKILLS = ("list wifi networks: nmcli -f SIGNAL,SSID dev wifi | sort -rn\n"
+          "strongest wifi nearby: nmcli -f SIGNAL,SSID dev wifi | sort -rn | head -n1\n"
+          "wifi you are connected to: nmcli -t -f NAME connection show --active | head -n1\n"
+          "serve a web page showing a message: echo 'Hello from the Cardputer' > index.html; python3 -m http.server 8080\n"
+          "web server for the current folder: python3 -m http.server 8080\n"
+          "battery percent: cat /sys/class/power_supply/bq27220-0/capacity\n"
+          "cpu temperature: vcgencmd measure_temp\n"
+          "free memory: free -h\n"
+          "disk space left: df -h /\n"
+          "list files biggest first: ls -lhS\n"
+          "your ip address: hostname -I\n"
+          "ping the internet: ping -c 3 1.1.1.1\n"
+          "connect to a wifi network: nmcli dev wifi connect SSID password PASS\n"
+          "run python code: python3 -c 'print(2 + 2)'\n"
+          "read a file in python: python3 -c \"print(open('notes.txt').read())\"\n"
+          "write a python script and run it: printf '#!/usr/bin/env python3\\nprint(\"hi\")\\n' > app.py; python3 app.py\n"
+          "download a web page: curl -s https://example.com\n"
+          "pretty-print json: python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), indent=2))'\n"
+          "take a photo with the camera: rpicam-still -o photo.jpg\n")
+CODE_ID = hashlib.md5(repr((CODE_SYSTEM, CODE_SHOTS, SKILLS)).encode()).hexdigest()[:8]  # names the saved prompt state
+SCRIPT_NAME = re.compile(r"\w[\w.-]{0,40}\.(sh|py)")  # what a model may name a file: no paths, scripts only
+EDIT_WORDS = set("it this fix change edit add also instead remove replace rename update".split())
+STOPWORDS = set("the a an to of my is it and in for show print me script that called set every time python sh read if under over".split())
+
+# key: (description, size MB, url). *.gguf are chat models, *.onnx are vision (object detection) models.
+CATALOG = {
+    "falcon-h1-90m": ("Smallest and fast. Best for Code.", 56,
+                      HF + "tiiuae/Falcon-H1-Tiny-90M-Instruct-GGUF/resolve/main/Falcon-H1-Tiny-90M-Instruct-Q4_K_M.gguf"),
+    "falcon-h1-multi-100m": ("Tiny and multilingual.", 70,
+                             HF + "mradermacher/Falcon-H1-Tiny-Multilingual-100M-Instruct-GGUF/resolve/main/"
+                             "Falcon-H1-Tiny-Multilingual-100M-Instruct.Q4_K_M.gguf"),
+    "smollm2-135m": ("English only.", 101,
+                     HF + "bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"),
+    "lfm2.5-230m": ("Best chat. Multilingual.", 146,
+                    HF + "LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_K_M.gguf"),
+    "lfm2-350m": ("Smarter code. Needs Power mode.", 219,
+                  HF + "LiquidAI/LFM2-350M-GGUF/resolve/main/LFM2-350M-Q4_K_M.gguf"),
+    "qwen2.5-coder-0.5b": ("Best coder, but slow (leave it thinking).", 469,
+                           HF + "Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"),
+    "yolox-nano": ("Vision. Built in, fastest.", 4, YOLOX + "yolox_nano.onnx"),
+    "yolox-tiny": ("Vision. Sharper, slower.", 19, YOLOX + "yolox_tiny.onnx"),
+}
+
+COCO = ("person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,traffic light,fire hydrant,stop sign,"
+        "parking meter,bench,bird,cat,dog,horse,sheep,cow,elephant,bear,zebra,giraffe,backpack,umbrella,handbag,tie,"
+        "suitcase,frisbee,skis,snowboard,sports ball,kite,baseball bat,baseball glove,skateboard,surfboard,"
+        "tennis racket,bottle,wine glass,cup,fork,knife,spoon,bowl,banana,apple,sandwich,orange,broccoli,carrot,"
+        "hot dog,pizza,donut,cake,chair,couch,potted plant,bed,dining table,toilet,tv,laptop,mouse,remote,keyboard,"
+        "cell phone,microwave,oven,toaster,sink,refrigerator,book,clock,vase,scissors,teddy bear,hair drier,"
+        "toothbrush").split(",")
+
+W, H = 320, 170
+BG, PANEL, TEXT, DIM = (10, 10, 14), (26, 27, 36), (236, 236, 242), (122, 124, 140)
+ACCENT, SOFT, GREEN, WARN = (206, 38, 54), (255, 122, 118), (72, 190, 84), (255, 176, 64)  # SOFT: accent for text
+
+server = None       # running llama-server Popen
+server_key = None   # which model it has loaded
+downloads = {}      # key -> (done, total) bytes, or an error string
+
+
+# ---------------------------------------------------------------- models & llama-server
+
+def catalog():
+    """Built-in models plus any other .gguf / .onnx file the user copied into the models folder."""
+    known = {url.rsplit("/", 1)[1] for _, _, url in CATALOG.values()}
+    own = {p.name: (f"Your own {'vision' if p.suffix == '.onnx' else 'chat'} model.", p.stat().st_size >> 20, None)
+           for p in sorted(MODELS.glob("*.*")) if p.suffix in (".gguf", ".onnx") and p.name not in known}
+    return {**CATALOG, **own}
+
+
+def model_path(key):
+    name = CATALOG[key][2].rsplit("/", 1)[1] if key in CATALOG else key
+    return HERE / name if (HERE / name).exists() else MODELS / name  # models shipped with the app live beside it
+
+
+def is_vision(key):
+    return model_path(key).suffix == ".onnx"
+
+
+def usable(vision):
+    """Installed models of one kind, the configured default first."""
+    keys_ = [k for k in catalog() if installed(k) and is_vision(k) == vision]
+    default = load_config().get("vision" if vision else "model")
+    return sorted(keys_, key=lambda k: k != default)
+
+
+def installed(key):
+    return model_path(key).exists()
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg))
+
+
+def model_budget_mb():
+    """Largest model that still runs from RAM instead of thrashing: total RAM minus what the system and this
+    app keep. Measured on a stock Cardputer Zero (352 MB visible) with the app open: a 56 MB model generates
+    8 tokens/s, a 98 MB one 0.4 because part of it no longer stays in memory."""
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemTotal"):
+            return int(line.split()[1]) // 1024 - (230 if extra_ram_on() else 262)
+    return 0
+
+
+def stop_server():
+    global server, server_key
+    proc, server, server_key = server, None, None
+    if proc:
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+atexit.register(stop_server)
+for _sig in (signal.SIGTERM, signal.SIGHUP):  # closed by the launcher: exit normally so the cleanups above run
+    signal.signal(_sig, lambda *_: sys.exit(0))
+
+
+def ensure_server(key):
+    """Start llama-server with `key` loaded (restarting if another model is up). True when ready."""
+    global server, server_key
+    if server and server.poll() is None and server_key == key:
+        return True
+    stop_server()
+    port = URL.rsplit(":", 1)[1]
+    # a server orphaned by a crashed or killed app would keep ~100 MB and make everything crawl
+    subprocess.run(["pkill", "-f", f"llama-server .*--port {port}"], capture_output=True)
+    (DATA / "slots").mkdir(parents=True, exist_ok=True)
+    cmd = [str(LLAMA / "llama-server"), "-m", str(model_path(key)), "--host", "127.0.0.1", "--port", port,
+           "-c", "2048", "-t", "4", "-np", "1", "--cache-ram", "0", "--no-warmup", "--slot-save-path", str(DATA / "slots")]
+    try:
+        proc = server = subprocess.Popen(cmd, stdout=open(LOG, "w"), stderr=subprocess.STDOUT)
+    except OSError:
+        return False
+    server_key = key
+    while proc.poll() is None and server is proc:  # stop_server() from the UI also ends this wait
+        try:
+            urllib.request.urlopen(URL + "/health", timeout=2)
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def slot(action, name):
+    """Save or restore the server's processed-prompt state (llama.cpp slot file). True on success.
+    Reading the Code examples takes about a minute on the CM0; restoring them from disk takes a second."""
+    req = urllib.request.Request(f"{URL}/slots/0?action={action}", json.dumps({"filename": name}).encode(),
+                                 {"Content-Type": "application/json"})
+    path = DATA / "slots" / name
+    try:
+        urllib.request.urlopen(req, timeout=120).close()
+        ok = path.stat().st_size > 1000  # a starved server has been seen writing a 16-byte, useless file
+    except OSError:
+        ok = False
+    if not ok:
+        path.unlink(missing_ok=True)  # never keep a file that cannot be restored
+    return ok
+
+
+def sse_deltas(lines):
+    """Yield text pieces from an OpenAI-style streaming response (iterable of bytes lines)."""
+    for line in lines:
+        line = line.strip()
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            continue
+        choices = json.loads(line[6:]).get("choices") or [{}]
+        text = choices[0].get("delta", {}).get("content")
+        if text:
+            yield text
+
+
+def stream(messages, stop, max_tokens=300, temperature=0.8):
+    """Yield reply pieces from the running server until done or `stop` is set."""
+    body = json.dumps({"messages": messages, "stream": True, "max_tokens": max_tokens,
+                       "temperature": temperature}).encode()
+    req = urllib.request.Request(URL + "/v1/chat/completions", body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        for text in sse_deltas(r):
+            if stop.is_set():
+                return
+            yield text
+
+
+def download(key):
+    """Fetch a model into MODELS, reporting progress in downloads[key]."""
+    # shortcut: no cancel/resume, a failed download restarts from zero; add Range requests if that hurts
+    dest = model_path(key)
+    part = dest.with_suffix(".part")
+    try:
+        MODELS.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(CATALOG[key][2], timeout=30) as r, open(part, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            if total > shutil.disk_usage(MODELS).free:
+                raise OSError("not enough disk space")
+            done = 0
+            while chunk := r.read(1 << 18):
+                f.write(chunk)
+                done += len(chunk)
+                downloads[key] = (done, total)
+        if total and done != total:
+            raise OSError("download incomplete")
+        part.rename(dest)
+        del downloads[key]
+    except OSError as e:
+        part.unlink(missing_ok=True)
+        downloads[key] = str(e)[:40]
+
+
+# ---------------------------------------------------------------- object detection
+
+def load_detector(np, path):
+    """Open an ONNX detector. Understands YOLOX exports ([N, 5+classes]) and YOLOv8-style ones ([4+classes, N]).
+    Class names come from a `<model>.txt` next to the file (one per line), else the 80 COCO names."""
+    import onnxruntime as ort  # not cv2: Debian's OpenCV takes 15-45 s to import on the CM0
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 3  # leave a core for the camera and the UI
+    sess = ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
+    size, shape = sess.get_inputs()[0].shape[2], sess.get_outputs()[0].shape
+    size = size if isinstance(size, int) else 416
+    grids, strides = [], []
+    for stride in (8, 16, 32):
+        n = size // stride
+        ys, xs = np.mgrid[0:n, 0:n]
+        grids.append(np.stack((xs, ys), -1).reshape(-1, 2))
+        strides.append(np.full((n * n, 1), stride))
+    names = path.with_suffix(".txt")
+    return {"sess": sess, "input": sess.get_inputs()[0].name, "size": size,
+            "v8": all(isinstance(d, int) for d in shape[1:3]) and shape[1] < shape[2],
+            "grid": np.concatenate(grids), "stride": np.concatenate(strides),
+            "names": names.read_text().splitlines() if names.exists() else COCO}
+
+
+def nms(np, boxes, scores, iou=0.45):
+    """Indices of the boxes (x, y, w, h) to keep, dropping lower-scored overlaps."""
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 0] + boxes[:, 2], boxes[:, 1] + boxes[:, 3]
+    area, order, keep = boxes[:, 2] * boxes[:, 3], scores.argsort()[::-1], []
+    while order.size:
+        i, rest = order[0], order[1:]
+        keep.append(i)
+        inter = (np.clip(np.minimum(x2[i], x2[rest]) - np.maximum(x1[i], x1[rest]), 0, None)
+                 * np.clip(np.minimum(y2[i], y2[rest]) - np.maximum(y1[i], y1[rest]), 0, None))
+        order = rest[inter / (area[i] + area[rest] - inter + 1e-9) <= iou]
+    return keep
+
+
+def detect(np, det, frame, threshold=0.4):
+    """Run the detector on an RGB frame -> [(label, confidence, x, y, w, h)] in frame pixels."""
+    size, (h, w) = det["size"], frame.shape[:2]
+    r = min(size / h, size / w)
+    nh, nw = int(h * r), int(w * r)
+    img = np.full((size, size, 3), 114, np.uint8)  # letterbox with grey padding, nearest-neighbour resize
+    img[:nh, :nw] = frame[(np.arange(nh) / r).astype(int)][:, (np.arange(nw) / r).astype(int)]
+    chw = img.transpose(2, 0, 1)[None]
+    if det["v8"]:   # RGB 0-1 in, boxes already in pixels, no objectness column
+        out = det["sess"].run(None, {det["input"]: chw.astype(np.float32) / 255})[0][0].T
+        xy, wh, scores = out[:, :2], out[:, 2:4], out[:, 4:]
+    else:           # YOLOX: BGR 0-255 in, boxes relative to a grid
+        out = det["sess"].run(None, {det["input"]: chw[:, ::-1].astype(np.float32)})[0][0]
+        xy, wh = (out[:, :2] + det["grid"]) * det["stride"], np.exp(out[:, 2:4]) * det["stride"]
+        scores = out[:, 4:5] * out[:, 5:]
+    cls, conf = scores.argmax(1), scores.max(1)
+    keep = conf > threshold
+    boxes, conf, cls, names = np.hstack((xy - wh / 2, wh))[keep] / r, conf[keep], cls[keep], det["names"]
+    return [(names[cls[i]] if cls[i] < len(names) else str(cls[i]), float(conf[i]), *map(int, boxes[i]))
+            for i in nms(np, boxes, conf)]
+
+
+def summary(dets):
+    """Group detections by label -> [(label, count, best confidence)], most confident first."""
+    best = {}
+    for label, conf, *_ in dets:
+        n, c = best.get(label, (0, 0))
+        best[label] = (n + 1, max(c, conf))
+    return sorted(((l, n, c) for l, (n, c) in best.items()), key=lambda t: -t[2])
+
+
+# ---------------------------------------------------------------- UI helpers
+
+# Linux keycodes of the built-in keyboard rows: first code -> (plain, shifted) characters
+ROWS = {2: ("1234567890-=", "!@#$%^&*()_+"), 16: ("qwertyuiop[]", "QWERTYUIOP{}"),
+        30: ("asdfghjkl;'`", 'ASDFGHJKL:"~'), 43: ("\\zxcvbnm,./", "|ZXCVBNM<>?"), 57: (" ", " ")}
+CHARS = {first + i: pair for first, (plain, shifted) in ROWS.items() for i, pair in enumerate(zip(plain, shifted))}
+SPECIAL = {1: 27, 14: 8, 15: 9, 28: 13, 96: 13}  # esc, backspace, tab, enter -> same values as pygame.K_*
+fb = kbd = None     # LCD framebuffer mmap and keyboard fd when running on the device
+shift, ctrl = set(), set()  # modifier keycodes currently held
+
+
+def init_ui():
+    """Set up drawing. On the device the LCD is not a Wayland/KMS output: like the stock apps we render
+    off-screen and copy to /dev/fb_lcd (RGB565), and read the keyboard straight from evdev."""
+    global pygame, screen, clock, F, FB, FS, FT, FM, fb, fb565, kbd
+    on_device = os.path.exists("/dev/fb_lcd") and "SDL_VIDEODRIVER" not in os.environ
+    if on_device:
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+    import pygame
+    pygame.init()
+    if on_device:
+        import mmap
+        pygame.display.set_mode((1, 1))
+        screen = pygame.Surface((W, H))
+        fb565 = pygame.Surface((W, H), depth=16, masks=(0xF800, 0x07E0, 0x001F, 0))
+        fb = mmap.mmap(os.open("/dev/fb_lcd", os.O_RDWR), W * H * 2)
+        name = next((p for p in Path("/sys/class/input").glob("input*/name") if p.read_text().strip() == "tca8418c"), None)
+        if name:
+            kbd = os.open(f"/dev/input/{next(name.parent.glob('event*')).name}", os.O_RDONLY | os.O_NONBLOCK)
+    else:  # desktop window for development
+        screen = pygame.display.set_mode((W, H))
+        pygame.key.set_repeat(400, 60)
+    clock = pygame.time.Clock()
+    SPECIAL.update({103: pygame.K_UP, 108: pygame.K_DOWN, 105: pygame.K_LEFT, 106: pygame.K_RIGHT,
+                    104: pygame.K_PAGEUP, 109: pygame.K_PAGEDOWN, 111: pygame.K_DELETE})
+
+    def font(size, style=""):  # by path: pygame's font lookup shells out to fc-list, which times out on the CM0
+        path = f"/usr/share/fonts/truetype/dejavu/DejaVuSans{style}.ttf"
+        return pygame.font.Font(path if os.path.exists(path) else None, size)
+    F, FS, FB, FT, FM = font(12), font(10), font(12, "-Bold"), font(20, "-Bold"), font(10, "Mono")
+
+
+def keys():
+    """Return the keys pressed since the last call as [(key, unicode)], key being a pygame.K_* value."""
+    out = []
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT:
+            raise SystemExit
+        if e.type == pygame.KEYDOWN:
+            out.append((e.key, e.unicode))
+    while kbd is not None:
+        try:
+            buf = os.read(kbd, 24 * 32)
+        except BlockingIOError:
+            break
+        for off in range(0, len(buf) - 23, 24):  # struct input_event on 64-bit: time(16) type code value
+            _, _, kind, code, value = struct.unpack_from("qqHHi", buf, off)
+            if kind != 1:
+                continue
+            if code in (42, 54):
+                (shift.add if value else shift.discard)(code)
+            elif code in (29, 97):
+                (ctrl.add if value else ctrl.discard)(code)
+            elif value and ctrl and code in CHARS:  # Ctrl+letter arrives as a control character, as in a terminal
+                out.append((ord(CHARS[code][0]), chr(ord(CHARS[code][0]) & 31)))
+            elif value and code in SPECIAL:
+                out.append((SPECIAL[code], ""))
+            elif value and code in CHARS:
+                out.append((ord(CHARS[code][0]), CHARS[code][bool(shift)]))
+    return out
+
+
+def flip(fps=20):
+    if fb:
+        fb565.blit(screen, (0, 0))
+        fb.seek(0)
+        fb.write(fb565.get_buffer().raw)
+    else:
+        pygame.display.flip()
+    clock.tick(fps)
+
+
+def step(k, u):
+    """-1/+1 for up/down in menus. The keyboard prints arrows on F and X; real arrow codes need Fn held."""
+    return {pygame.K_UP: -1, pygame.K_DOWN: 1}.get(k) or {"f": -1, "x": 1}.get(u.lower(), 0)
+
+
+def text(s, x, y, font=None, color=TEXT, right=False):
+    img = (font or F).render(s, True, color)
+    screen.blit(img, (x - img.get_width() if right else x, y))
+    return img.get_width()
+
+
+def battery():
+    """Charge percent from the battery gauge, or None off-device (e.g. on a dev PC)."""
+    try:
+        for p in sorted(Path("/sys/class/power_supply").glob("*/capacity")):
+            return int(p.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def header(title, hint=""):
+    screen.fill(BG)
+    pygame.draw.rect(screen, PANEL, (0, 0, W, 17))
+    pygame.draw.rect(screen, ACCENT, (0, 0, 3, 17))
+    text(title, 8, 1, FB)
+    text(hint, W - 5, 3, FS, DIM, right=True)
+
+
+def code_bar(title, model, busy="", running=0):
+    """Top bar for the Code screens: project/view on the left, current model and battery on the right."""
+    screen.fill(BG)
+    pygame.draw.rect(screen, PANEL, (0, 0, W, 17))
+    pygame.draw.rect(screen, ACCENT, (0, 0, 3, 17))
+    status = (busy + "…  " if busy else f"{running} running  " if running else "")
+    text(fit(status + title, FB, 168), 8, 1, FB)
+    batt = battery()
+    right = (model or "no model") + (f"  {batt}%" if batt is not None else "")
+    text(fit(right, FS, W - 180), W - 5, 3, FS, DIM, right=True)
+
+
+@functools.lru_cache(maxsize=512)
+def wrap(s, width, small=False):
+    """Split text into lines no wider than `width` pixels (breaking long words too)."""
+    font, lines = (FS if small else F), []
+    for para in s.split("\n"):
+        line = ""
+        for word in para.split(" "):
+            trial = f"{line} {word}" if line else word
+            while font.size(trial)[0] > width:
+                if line:
+                    lines.append(line)
+                    line, trial = "", word
+                else:  # a single word wider than the screen: cut it
+                    n = next(i for i in range(len(trial), 0, -1) if font.size(trial[:i])[0] <= width or i == 1)
+                    lines.append(trial[:n])
+                    trial = word = trial[n:]
+            line = trial
+        lines.append(line)
+    return lines
+
+
+def text_view(title, body, hint="Esc back"):
+    """Scrollable full-screen text. Returns True if closed with Enter, False with Esc/Backspace."""
+    lines, top = wrap(body, W - 12), 0
+    while True:
+        for k, u in keys():
+            if k in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_BACKSPACE):
+                return k == pygame.K_RETURN
+            top += step(k, u)
+        top = max(0, min(top, len(lines) - 10))
+        header(title, hint)
+        for i, line in enumerate(lines[top:top + 10]):
+            text(line, 6, 21 + i * 15)
+        flip()
+
+
+def fit(s, font, width):
+    """Cut `s` so it is at most `width` pixels wide."""
+    while s and font.size(s)[0] > width:
+        s = s[:-1]
+    return s
+
+
+KINDS = {".sh": ("sh", (72, 190, 84)), ".py": ("py", (80, 150, 255)), ".off": ("--", (70, 72, 84)),
+         ".txt": ("tx", (150, 152, 168)), ".md": ("md", (150, 152, 168)), ".json": ("js", (200, 140, 255))}
+
+
+def badge(path, x, y):
+    """File-type icon for the file manager: a folder shape or a coloured tag with the type. Returns its width."""
+    if path.is_dir():
+        pygame.draw.rect(screen, WARN, (x, y + 1, 9, 4), border_radius=2)
+        pygame.draw.rect(screen, WARN, (x, y + 3, 18, 11), border_radius=2)
+    else:
+        tag, color = KINDS.get(path.suffix, ("..", (150, 152, 168)))
+        pygame.draw.rect(screen, color, (x, y, 18, 14), border_radius=3)
+        text(tag, x + 3, y + 1, FM, BG)
+    return 22
+
+
+def draw_rows(x, w, rows, sel, count=6):
+    """Draw a window of (label, detail[, path for an icon]) rows around the selected one. sel=None: no highlight."""
+    first = max(0, min((sel or 0) - 2, len(rows) - count))
+    for row, i in enumerate(range(first, min(first + count, len(rows)))):
+        y = 20 + row * 22
+        pygame.draw.rect(screen, ACCENT if i == sel else PANEL, (x, y, w, 20), border_radius=5)
+        dw = text(rows[i][1], x + w - 6, y + 5, FS, TEXT if i == sel else DIM, right=True)
+        pad = badge(rows[i][2], x + 4, y + 3) if len(rows[i]) > 2 else 0
+        text(fit(rows[i][0], FB, w - dw - 18 - pad), x + 6 + pad, y + 3, FB)
+
+
+def pick(title, rows, hint, actions=""):
+    """List menu of (label, detail) rows. Returns (index, "enter" or the action letter), or (None, None) on Esc."""
+    sel = 0
+    while True:
+        for k, u in keys():
+            if k == pygame.K_ESCAPE:
+                return None, None
+            if k == pygame.K_F1:
+                help_modal()
+                continue
+            sel = (sel + step(k, u)) % len(rows)
+            if k == pygame.K_RETURN or (u and u.lower() in actions):
+                return sel, "enter" if k == pygame.K_RETURN else u.lower()
+        header(title, f"{sel + 1}/{len(rows)}")
+        draw_rows(4, W - 8, rows, sel)
+        text(hint, 6, 155, FS, DIM)
+        flip(10)
+
+
+def ask_line(title, prompt, secret=False):
+    """One-line text input (shown as stars if secret). Returns the text, or None if cancelled with Esc."""
+    typed = ""
+    while True:
+        for k, u in keys():
+            if k == pygame.K_ESCAPE:
+                return None
+            if k == pygame.K_RETURN:
+                return typed.strip()
+            if k == pygame.K_BACKSPACE:
+                typed = typed[:-1]
+            elif u and u.isprintable():
+                typed += u
+        header(title, "Enter ok  Esc cancel")
+        text(prompt, 6, 30, color=DIM)
+        pygame.draw.rect(screen, PANEL, (4, 52, W - 8, 100), border_radius=6)
+        for i, line in enumerate(wrap(("*" * len(typed) if secret else typed) + ("_" if time.time() % 1 < 0.5 else ""), W - 20)[-6:]):
+            text(line, 10, 56 + i * 15)
+        flip()
+
+
+# ---------------------------------------------------------------- screens
+
+def home():
+    items = [("Code", "Projects. Kesha writes scripts, you run them.", code),
+             ("Chat", "Talk to a model", chat), ("Vision", "Live camera AI", vision),
+             ("Models", "Get and pick AIs", models), ("Settings", "RAM, camera", settings)]
+    cards = [(112, 5, 202, 60), (112, 69, 99, 46), (215, 69, 99, 46), (112, 119, 99, 46), (215, 119, 99, 46)]
+    logo = pygame.transform.smoothscale(pygame.image.load(str(HERE / "icon.png")), (84, 84))
+    sel = 0
+    while True:
+        for k, u in keys():
+            if k == pygame.K_ESCAPE:
+                return
+            if k == pygame.K_F1:
+                help_modal()
+                continue
+            # Code is the big card on top, the rest a 2x2 grid: F/X move by rows, Z/C by one
+            move = {"f": -2, "x": 2, "z": -1, "c": 1}.get(u.lower(), 0) or 2 * step(k, u)
+            move += {pygame.K_LEFT: -1, pygame.K_RIGHT: 1}.get(k, 0)
+            sel = max(0, min(len(items) - 1, sel + (move if sel else min(move, 1))))
+            if u and u in "12345":
+                sel = int(u) - 1
+            if k == pygame.K_RETURN or (u and u in "12345"):
+                items[sel][2]()
+        screen.fill(BG)
+        screen.blit(logo, (12, 18))
+        text("Kesha", 54 - FT.size("Kesha")[0] // 2, 104, FT)
+        for j, line in enumerate(("Code LLM", f"RAM fits {model_budget_mb()}MB", "F1 = help")):
+            text(line, 54 - FS.size(line)[0] // 2, 128 + j * 12, FS, DIM)
+        for i, ((name, desc, _), (x, y, w, h)) in enumerate(zip(items, cards)):
+            pygame.draw.rect(screen, ACCENT if i == sel else PANEL, (x, y, w, h), border_radius=8)
+            if i == 0:
+                text("</>", x + w - 12, y + 6, FT, TEXT if sel == 0 else ACCENT, right=True)
+                text(name, x + 10, y + 5, FT)
+                for n, line in enumerate(wrap(desc, w - 20, True)[:2]):
+                    text(line, x + 10, y + 31 + n * 12, FS, TEXT if sel == 0 else DIM)
+            else:
+                text(name, x + 8, y + 7, FB)
+                text(desc, x + 8, y + 25, FS, TEXT if i == sel else DIM)
+        flip(10)
+
+
+def chat():
+    have = usable(vision=False)
+    if not have:
+        return text_view("Chat", "No model installed yet.\n\nOpen Models and download one first.")
+    key = have[0]
+    msgs, typed, scroll = [], "", 0   # msgs: [role, text] with role user/assistant/error
+    busy, stop = [""], threading.Event()
+
+    def work(question=None):
+        try:
+            busy[0] = "loading"
+            if not ensure_server(key):
+                if busy[0]:  # not cancelled by leaving the screen
+                    msgs.append(["error", "Could not load the model. It may be too big for the free RAM."])
+                return
+            if question:
+                busy[0] = "thinking"
+                history = [{"role": r, "content": t} for r, t in msgs if r != "error"][-8:]
+                reply = ["assistant", ""]
+                msgs.append(reply)
+                for piece in stream([{"role": "system", "content": SYSTEM}] + history, stop):
+                    reply[1] += piece
+        except (OSError, ValueError) as e:
+            msgs.append(["error", str(e)])
+        finally:
+            busy[0] = ""
+
+    def start(question=None):
+        stop.clear()
+        busy[0] = "loading"
+        threading.Thread(target=work, args=(question,), daemon=True).start()
+
+    start()
+    while True:
+        for k, u in keys():
+            if k == pygame.K_ESCAPE:
+                if busy[0] == "thinking":
+                    stop.set()
+                    continue
+                if busy[0]:
+                    busy[0] = ""
+                    stop_server()
+                return
+            if k == pygame.K_TAB and not busy[0] and len(have) > 1:
+                key = have[(have.index(key) + 1) % len(have)]
+                save_config({**load_config(), "model": key})
+                start()
+            elif k in (pygame.K_UP, pygame.K_DOWN):
+                scroll = max(0, scroll + (1 if k == pygame.K_UP else -1))
+            elif k == pygame.K_BACKSPACE:
+                typed = typed[:-1]
+            elif k == pygame.K_RETURN:
+                if typed.strip() and not busy[0]:
+                    msgs.append(["user", typed.strip()])
+                    typed, scroll = "", 0
+                    start(msgs[-1][1])
+            elif u and u.isprintable():
+                typed += u
+
+        header(f"Chat · {key}", busy[0] + "..." if busy[0] else ("Tab model  " if len(have) > 1 else "") + "Esc back")
+        lines = []
+        for role, body in msgs:
+            color = {"user": SOFT, "error": WARN}.get(role, TEXT)
+            lines += [(line, color) for line in wrap(("> " if role == "user" else "") + body, W - 12)]
+        if busy[0] == "thinking" and not msgs[-1][1]:
+            lines.append(("Kesha is thinking" + "." * (int(time.time() * 2) % 4), DIM))
+        if not msgs:
+            lines = [("Say hi to Kesha!", DIM)]
+        scroll = min(scroll, max(0, len(lines) - 9))
+        end = len(lines) - scroll
+        for i, (line, color) in enumerate(lines[max(0, end - 9):end]):
+            text(line, 6, 20 + i * 14, color=color)
+        if busy[0] == "loading":
+            pygame.draw.rect(screen, PANEL, (50, 52, 220, 56), border_radius=10)
+            pygame.draw.rect(screen, ACCENT, (50, 52, 220, 56), 2, border_radius=10)
+            text("Loading model" + "." * (int(time.time() * 2) % 4), 88, 60, FB)
+            text("this takes a few seconds", 160 - FS.size("this takes a few seconds")[0] // 2, 84, FS, DIM)
+        pygame.draw.rect(screen, PANEL, (4, 149, W - 8, 18), border_radius=5)
+        shown = typed + ("_" if time.time() % 1 < 0.5 else "")
+        while F.size(shown)[0] > W - 20:
+            shown = shown[1:]
+        text(shown, 10, 151)
+        flip()
+
+
+def models():
+    sel, confirm = 0, None
+    while True:
+        cat = catalog()
+        order = list(cat)
+        sel = min(sel, len(order))  # index len(order) is the "add your own" help row
+        key = order[sel] if sel < len(order) else None
+        for k, u in keys():
+            was_confirm, confirm = confirm, None
+            if k == pygame.K_ESCAPE:
+                return
+            sel = (sel + step(k, u)) % (len(order) + 1)
+            if key is None:
+                continue
+            if k == pygame.K_RETURN and installed(key):
+                save_config({**load_config(), "vision" if is_vision(key) else "model": key})
+            elif k == pygame.K_RETURN and not isinstance(downloads.get(key), tuple):
+                downloads[key] = (0, 0)
+                threading.Thread(target=download, args=(key,), daemon=True).start()
+            elif u.lower() == "d" and installed(key) and model_path(key).parent != HERE:  # built-ins stay
+                if was_confirm == key:
+                    if server_key == key:
+                        stop_server()
+                    model_path(key).unlink(missing_ok=True)
+                else:
+                    confirm = key
+        cfg, fits = load_config(), model_budget_mb()
+        default = (cfg.get("model"), cfg.get("vision"))
+        header("Models", f"{sel + 1}/{len(order) + 1}   RAM fits {fits}MB")
+        first = max(0, min(sel - 1, len(order) - 2))  # 3 rows visible, keep the selection in view
+        for row, i in enumerate(range(first, min(first + 3, len(order) + 1))):
+            y = 21 + row * 43
+            pygame.draw.rect(screen, PANEL, (4, y, W - 8, 39), border_radius=7)
+            if i == sel:
+                pygame.draw.rect(screen, ACCENT, (4, y, W - 8, 39), 2, border_radius=7)
+            if i == len(order):
+                text("+ Add your own model", 28, y + 4, FB)
+                text(".gguf (chat) or .onnx (vision) into ~/.local/share/kesha-llm/models", 10, y + 22, FS, DIM)
+                continue
+            k = order[i]
+            desc, mb, _ = cat[k]
+            state = downloads.get(k)
+            pygame.draw.circle(screen, GREEN if installed(k) else DIM, (17, y + 12), 5, 0 if installed(k) else 1)
+            name = k if FB.size(k)[0] < 190 else k[:24] + "..."
+            big = mb > fits and not is_vision(k)
+            text(name + ("  (default)" if k in default and installed(k) else ""), 28, y + 4, FB)
+            text(f"{mb}MB", W - 12, y + 5, FS, WARN if big else DIM, right=True)
+            if isinstance(state, tuple):
+                done, total = state
+                pygame.draw.rect(screen, BG, (28, y + 24, 220, 8), border_radius=4)
+                pygame.draw.rect(screen, GREEN, (28, y + 24, 220 * done // max(total, 1), 8), border_radius=4)
+                text(f"{done >> 20}/{total >> 20}", W - 12, y + 21, FS, DIM, right=True)
+            elif confirm == k:
+                text("Press D again to delete", 28, y + 21, FS, WARN)
+            elif state:
+                text(f"Failed: {state}", 28, y + 21, FS, WARN)
+            else:
+                text(desc + ("  Too big for RAM!" if big else ""), 28, y + 21, FS, DIM)
+        hint = "" if key is None else "Enter: use   D: delete   " if installed(key) else "Enter: download   "
+        text(hint + "F/X: move   Esc: back", 6, 154, FS, DIM)
+        flip(10)
+
+
+def ocr(surface):
+    """Read text from a camera image with tesseract and show it."""
+    if not shutil.which("tesseract"):
+        return text_view("Read text", "tesseract is not installed.\n\nsudo apt install tesseract-ocr")
+    header("Read text", "reading...")
+    flip()
+    photo = DATA / "ocr.png"
+    DATA.mkdir(parents=True, exist_ok=True)
+    pygame.image.save(surface, str(photo))
+    langs = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True).stdout.split("\n")[1:]
+    r = subprocess.run(["tesseract", str(photo), "-", "-l", "+".join(l for l in langs if l and l != "osd") or "eng"],
+                       capture_output=True, text=True)
+    text_view("Read text", r.stdout.strip() or "(no text found)")
+
+
+def vision():
+    stop_server()  # the LLM and the camera stack do not fit in RAM together
+    header("Vision")
+    text("Starting camera...", 100, 66, FB)
+    text("this can take up to 20 seconds", 160 - FS.size("this can take up to 20 seconds")[0] // 2, 88, FS, DIM)
+    flip()
+    try:
+        import numpy as np
+        from picamera2 import Picamera2
+        cam = Picamera2()
+        # shortcut: 640x480 is enough for boxes but coarse for OCR of small print; use a still mode if needed
+        cam.configure(cam.create_preview_configuration(main={"size": (640, 480), "format": "BGR888"}))  # = RGB bytes
+        cam.start()
+    except Exception as e:  # missing module, camera busy or absent: all end the same way for the user
+        return text_view("Vision", f"Camera not available.\n\n{e}")
+    have = usable(vision=True)
+    shared = {"frame": None, "dets": [], "ms": 0, "run": True, "key": have[0], "error": ""}
+
+    def loop():
+        loaded = det = None
+        while shared["run"]:
+            try:
+                if loaded != shared["key"]:
+                    loaded, det = shared["key"], None
+                    det = load_detector(np, model_path(loaded))
+                    shared["error"] = ""
+                if det is None or shared["frame"] is None:
+                    time.sleep(0.1)
+                    continue
+                t = time.time()
+                shared["dets"] = detect(np, det, shared["frame"])
+                shared["ms"] = int((time.time() - t) * 1000)
+            except Exception as e:  # a model file this code cannot read must not kill the camera view
+                det, shared["dets"], shared["error"] = None, [], f"model error: {e}"[:48]
+
+    threading.Thread(target=loop, daemon=True).start()
+    mode, rec, log, rec_start, last_write, flash = 0, None, None, 0, 0, ("", 0)
+
+    def stop_rec():
+        log.close()
+        try:
+            rec.stdin.close()
+            rec.wait(10)
+        except (OSError, subprocess.TimeoutExpired):
+            rec.kill()
+
+    try:
+        while True:
+            big = cam.capture_array()
+            if not load_config().get("no_flip"):
+                big = big[::-1, ::-1]  # the camera is mounted upside down in the Cardputer Zero
+            frame = np.ascontiguousarray(big[::2, ::2])
+            shared["frame"] = frame
+            dets, seen = shared["dets"], summary(shared["dets"])
+            surf = pygame.image.frombytes(frame.tobytes(), (320, 240), "RGB")
+            for label, conf, x, y, w, h in dets:
+                color = [(hash(label) >> s) % 156 + 100 for s in (0, 8, 16)]
+                pygame.draw.rect(surf, color, (x, y, w, h), 2)
+                surf.blit(FS.render(f" {label} {conf:.0%} ", True, BG, color), (max(x, 0), max(y - 12, 0)))
+            now = time.time()
+            if rec and now - last_write >= 0.1:
+                last_write = now
+                try:
+                    rec.stdin.write(pygame.image.tobytes(surf, "RGB"))
+                except OSError:
+                    stop_rec()
+                    rec, flash = None, ("Recording failed", now + 2)
+                if seen:
+                    log.write(f"{now - rec_start:6.1f}s  " + ", ".join(f"{n}x {l} {c:.0%}" for l, n, c in seen) + "\n")
+
+            for k, u in keys():
+                u = u.lower()
+                if k == pygame.K_ESCAPE:
+                    return
+                if k == pygame.K_TAB:
+                    mode = (mode + 1) % 3
+                elif u == "m" and len(have) > 1:
+                    shared["key"] = have[(have.index(shared["key"]) + 1) % len(have)]
+                    shared["dets"] = []
+                    save_config({**load_config(), "vision": shared["key"]})
+                elif u in ("o", " "):
+                    full = pygame.image.frombytes(np.ascontiguousarray(big).tobytes(), (640, 480), "RGB")
+                    if u == "o":
+                        ocr(full)
+                    else:
+                        out = Path.home() / "Pictures" / time.strftime("kesha-%Y%m%d-%H%M%S.jpg")
+                        out.parent.mkdir(exist_ok=True)
+                        pygame.image.save(full, str(out))
+                        flash = ("Photo saved", now + 1.5)
+                elif u == "r" and rec:
+                    stop_rec()
+                    rec, flash = None, ("Video saved", now + 1.5)
+                elif u == "r":
+                    out = Path.home() / "Videos" / time.strftime("kesha-%Y%m%d-%H%M%S.mp4")
+                    out.parent.mkdir(exist_ok=True)
+                    try:  # wall-clock timestamps: the loop's frame rate is not constant
+                        rec = subprocess.Popen(
+                            ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "320x240",
+                             "-use_wall_clock_as_timestamps", "1", "-i", "-", "-c:v", "libx264", "-preset", "ultrafast",
+                             "-pix_fmt", "yuv420p", "-fps_mode", "vfr", str(out)], stdin=subprocess.PIPE)
+                        log, rec_start = open(out.with_suffix(".txt"), "w"), now
+                    except OSError:
+                        flash = ("ffmpeg is not installed", now + 2)
+
+            screen.fill(BG)
+            if mode == 0:    # split: camera left, what it sees with percentages right
+                screen.blit(pygame.transform.scale(surf, (226, 170)), (0, 0))
+                text("I SEE", 233, 3, FB, SOFT)
+                for i, (label, n, conf) in enumerate(seen[:6]):
+                    y = 21 + i * 22
+                    text((f"{n} " if n > 1 else "") + label, 233, y, FS)
+                    pygame.draw.rect(screen, PANEL, (233, y + 13, 82, 5), border_radius=2)
+                    pygame.draw.rect(screen, GREEN, (233, y + 13, int(82 * conf), 5), border_radius=2)
+                if not seen:
+                    text("nothing yet", 233, 21, FS, DIM)
+                text(f"{shared['ms']}ms", W - 4, 157, FS, DIM, right=True)
+            elif mode == 1:  # full screen camera with boxes, summary strip below
+                screen.blit(surf, (0, -35))
+                strip = pygame.Surface((W, 15), pygame.SRCALPHA)
+                strip.fill((*BG, 190))
+                screen.blit(strip, (0, 155))
+                text("  ".join(f"{l} {c:.0%}" for l, n, c in seen[:4]) or "nothing yet", 5, 156, FS)
+            else:            # list only: big readable results, small camera thumbnail and key help
+                header("Recognized", f"{shared['key'][:16]}  {shared['ms']}ms")
+                screen.blit(pygame.transform.scale(surf, (96, 72)), (W - 102, 22))
+                for i, (label, n, conf) in enumerate(seen[:7]):
+                    text(f"{n}x {label}", 8, 22 + i * 18, FB)
+                    text(f"{conf:.0%}", 200, 22 + i * 18, color=GREEN, right=True)
+                if not seen:
+                    text("nothing yet", 8, 22, color=DIM)
+                for i, line in enumerate(("Tab view  R record", "O read text", "Space photo", "M model  Esc back")):
+                    text(line, W - 6, 98 + i * 13, FS, DIM, right=True)
+            if rec:
+                pygame.draw.circle(screen, WARN, (10, 10), 5)
+                text(f"REC {int(now - rec_start)}s", 19, 4, FS)
+            if shared["error"]:
+                text(shared["error"], 6, 140, FS, WARN)
+            elif flash[1] > now:
+                text(flash[0], 6, 138, FB, GREEN)
+            flip(12)  # more than this starves the detector of CPU
+    finally:
+        shared["run"] = False
+        if rec:
+            stop_rec()
+        cam.stop()
+        cam.close()
+
+
+# ---------------------------------------------------------------- code: projects, files, editor, runs
+
+jobs = []  # script runs, newest first: {"name", "proc", "out": [lines]}. They keep running when you leave a screen.
+MAX_RUNNING = 3  # each run is a whole sh/python process; more than this and the 512 MB device starts swapping
+SYNTAX = re.compile(r"""("(?:\\.|[^"\\])*"?|'(?:\\.|[^'\\])*'?)|(#.*$)|\b(\d+)\b|\b(if|then|else|elif|fi|for|while|do|"""
+                    r"""done|case|esac|in|function|return|exit|def|class|import|from|try|except|finally|with|as|and|or|"""
+                    r"""not|None|True|False|echo|print)\b""")
+SYNTAX_COLORS = ((240, 170, 90), (110, 165, 110), (200, 140, 255), (110, 170, 255))  # string comment number keyword
+
+
+def paint(line):
+    """Split a line of sh/python into [(text, color)] for the editor."""
+    # shortcut: a '#' inside ${var#x} or $# is coloured as a comment; needs a real lexer to fix
+    out, pos = [], 0
+    for m in SYNTAX.finditer(line):
+        out += [(line[pos:m.start()], TEXT), (m.group(), SYNTAX_COLORS[m.lastindex - 1])]
+        pos = m.end()
+    return out + [(line[pos:], TEXT)]
+
+
+def stems(s):
+    return {w.rstrip("s") for w in re.findall(r"[a-z]+", s.lower())} - STOPWORDS
+
+
+def hints(ask, notes, n=2):
+    """The `label: command` lines of the context notes that best match the request, as commented commands.
+    The model cannot read files or remember a long list, so we hand it only the few lines it needs."""
+    scored = []
+    for line in notes.splitlines():
+        label, sep, command = line.partition(": ")
+        score = sep and len(stems(ask) & stems(label))  # labels only: commands are full of misleading words
+        if score:
+            scored.append((score, f"# {label}\n{command}"))
+    return [h for _, h in sorted(scored, key=lambda t: -t[0])[:n]]
+
+
+def refers(ask, file):
+    """Is the request about this script ("make it loop", "fix count.py")? Only then is the model shown the
+    selected file; shown every time, the small models copy it into every new script."""
+    return file.suffix in (".sh", ".py") and bool(set(re.findall(r"[\w.-]+", ask.lower()))
+                                                 & (EDIT_WORDS | {file.name, file.stem}))
+
+
+def code_prompt(notes, msgs, last_run="", file=None):
+    """Chat messages for the Code model: system line, worked examples, the conversation, then hints + task.
+    `file` is the script the user has selected: the model sees it and may answer with its name to change it."""
+    *earlier, ask = msgs
+    found = hints(ask["content"], notes + "\n" + SKILLS)  # project notes + built-in skills, best matches first
+    free = "\n".join(l for l in notes.splitlines() if l.strip() and ": " not in l)[:300]  # plain notes go in whole
+    shown = ""
+    if file:  # shown the way the model writes scripts itself: a block that starts with the name as a comment
+        body = file.read_text().strip()
+        body = body if body.startswith(f"# {file.name}") else f"# {file.name}\n{body}"
+        shown = f"```{'python' if file.suffix == '.py' else 'sh'}\n{body}\n```\n\n"
+    task = ((f"Notes:\n{free}\n\n" if free else "") + (f"Hints:\n" + "\n".join(found) + "\n\n" if found else "")
+            + shown + (f"{last_run}\n\n" if last_run else "") + "Task: " + ask["content"])
+    shots = [{"role": r, "content": c} for pair in CODE_SHOTS for r, c in zip(("user", "assistant"), pair)]
+    return [{"role": "system", "content": CODE_SYSTEM}] + shots + earlier + [{"role": "user", "content": task}]
+
+
+def extract_scripts(reply):
+    """Scripts in a model reply -> [(name or None, extension, code)]: every fenced block (named by its first
+    line when that is a comment with a valid script name), or the reply itself if it is bare code."""
+    def ext(lang, body):  # tiny models mislabel blocks, so the code decides when it is obviously Python
+        python = lang.lower() in ("python", "py", "python3") or re.search(r"^(import |from \w+ import |def |print\()", body, re.M)
+        shellish = re.search(r"^(echo |cat |ls |cd |rm |mkdir |cp |mv |touch |for \w+ in .*; do|nmcli |ping |curl |"
+                             r"wget |df |free |grep |sudo |apt |vcgencmd |hostname |sort |head |tail |chmod )", body, re.M)
+        return ".py" if python and not shellish else ".sh"
+
+    blocks = []
+    for m in re.finditer(r"```(\w*)[^\n]*\n(.*?)(?:```|\Z)", reply, re.S):
+        title = m.group(2).strip().split("\n")[0].lstrip("# ").strip()
+        name = title if SCRIPT_NAME.fullmatch(title) else None
+        if m.group(2).strip():
+            blocks.append((name, Path(name).suffix if name else ext(*m.groups()), m.group(2).strip() + "\n"))
+    first = (reply.split() or [""])[0]
+    if not blocks and (first.startswith("#!") or first in ("for", "if", "while", "import", "from", "def")
+                       or first.startswith("print(") or shutil.which(first)):
+        blocks = [(None, ext("", reply), reply.strip() + "\n")]  # no fence, but it starts like a script
+    return blocks
+
+
+def strip_comments(body):
+    """Drop full-line comments the model slipped in (the user wants clean scripts). The file-name marker on
+    line 0 and any shebang stay, since those are structure, not chatter. Inline comments are left alone: a '#'
+    mid-line may live inside a string or URL."""
+    lines = body.splitlines()
+    kept = [l for i, l in enumerate(lines) if i == 0 or not l.strip().startswith("#") or l.strip().startswith("#!")]
+    return "\n".join(kept).strip() + "\n"
+
+
+def tools_note(folder):
+    """Refresh .context/tools.txt: what is installed, so the model can be told. It starts switched off
+    (tools.txt.off) because extra text confuses the smallest models; turn it on with T in the file manager."""
+    cmds = ("python3 pip curl wget git ffmpeg ffplay pw-play pw-record rpicam-still ir-ctl nmcli bluetoothctl "
+            "gpioget gpioset vcgencmd tesseract jq bc lua5.1 node").split()
+    mods = "numpy PIL pygame requests evdev serial smbus2 gpiod picamera2 flask".split()
+    note = folder / ".context" / "tools.txt"
+    note = note if note.exists() else note.with_name("tools.txt.off")
+    note.parent.mkdir(exist_ok=True)
+    note.write_text("Installed commands - " + " ".join(c for c in cmds if shutil.which(c)) + "\nPython modules - "
+                    + " ".join(m for m in mods if importlib.util.find_spec(m)) + "\n")
+
+
+def slug(s, limit=24):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:limit].strip("-") or "script"
+
+
+def launch(path):
+    """Start a .sh/.py file in its folder as a background job. Returns the job, or None if too many are running."""
+    if sum(j["proc"].poll() is None for j in jobs) >= MAX_RUNNING:
+        return None
+    cmd = ["python3", "-u", path.name] if path.suffix == ".py" else ["sh", path.name]
+    proc = subprocess.Popen(cmd, cwd=path.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, text=True, errors="replace", start_new_session=True)
+    job = {"name": path.name, "proc": proc, "out": []}
+
+    def read():
+        for line in proc.stdout:
+            job["out"].append(line)
+            del job["out"][:-500]
+        proc.wait()
+
+    threading.Thread(target=read, daemon=True).start()
+    jobs.insert(0, job)
+    jobs[:] = [j for n, j in enumerate(jobs) if n < 8 or j["proc"].poll() is None]
+    return job
+
+
+def kill(job):
+    if job["proc"].poll() is None:
+        os.killpg(job["proc"].pid, signal.SIGKILL)  # the whole group: scripts start child processes
+
+
+atexit.register(lambda: [kill(j) for j in jobs])
+
+
+def status(job):
+    code_ = job["proc"].poll()
+    return "running" if code_ is None else "ok" if code_ == 0 else f"exit {code_}"
+
+
+def console(job):
+    """Live output of one run. Esc leaves it running in the background, K kills it."""
+    up = 0
+    while True:
+        for k, u in keys():
+            if k == pygame.K_ESCAPE:
+                return
+            if u.lower() == "k":
+                kill(job)
+            up = max(0, up - step(k, u) * 3)
+        lines = [l for raw in job["out"][-200:] for l in wrap(raw.rstrip("\n"), W - 8, True)] or ["(no output yet)"]
+        up = min(up, max(0, len(lines) - 11))
+        header(f"{job['name']} · {status(job)}", "K kill  Esc back")
+        end = len(lines) - up
+        for i, line in enumerate(lines[max(0, end - 11):end]):
+            text(line, 4, 20 + i * 12, FS)
+        text("F/X scroll   Esc keeps it running in the background", 4, 156, FS, DIM)
+        flip(10)
+
+
+def edit(path):
+    """Tiny code editor. Esc saves and closes, Ctrl+R saves and runs (returns True), Ctrl+Q closes without saving."""
+    lines = path.read_text(errors="replace").split("\n") if path.exists() else [""]
+    cy = cx = top = left = 0
+    cw, rows, cols = FM.size("M")[0], 11, (W - 26) // FM.size("M")[0]
+    while True:
+        for k, u in keys():
+            line = lines[cy]
+            if k == pygame.K_ESCAPE or u in ("\x12", "\x13"):   # Esc, Ctrl+R, Ctrl+S: all save
+                path.write_text("\n".join(lines))
+                if u != "\x13":
+                    return u == "\x12"
+            elif u == "\x11":                                   # Ctrl+Q
+                return False
+            elif k in (pygame.K_UP, pygame.K_DOWN, pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+                jump = {pygame.K_UP: -1, pygame.K_DOWN: 1, pygame.K_PAGEUP: -rows, pygame.K_PAGEDOWN: rows}[k]
+                cy = max(0, min(len(lines) - 1, cy + jump))
+            elif k == pygame.K_LEFT:
+                cx = cx - 1 if cx else cx
+            elif k == pygame.K_RIGHT:
+                cx += 1
+            elif k == pygame.K_RETURN:
+                indent = line[:len(line) - len(line.lstrip(" "))] if cx else ""
+                lines[cy:cy + 1] = [line[:cx], indent + line[cx:]]
+                cy, cx = cy + 1, len(indent)
+            elif k == pygame.K_BACKSPACE and cx:
+                lines[cy], cx = line[:cx - 1] + line[cx:], cx - 1
+            elif k == pygame.K_BACKSPACE and cy:
+                cx = len(lines[cy - 1])
+                lines[cy - 1:cy + 1] = [lines[cy - 1] + line]
+                cy -= 1
+            elif k == pygame.K_TAB or (u and u.isprintable()):
+                u = "    " if k == pygame.K_TAB else u
+                lines[cy], cx = line[:cx] + u + line[cx:], cx + len(u)
+            cx = min(cx, len(lines[cy]))
+        top = max(cy - rows + 1, min(top, cy))
+        left = max(cx - cols + 1, min(left, cx))
+        header(path.name, f"{cy + 1}:{cx + 1}")
+        screen.set_clip((24, 18, W - 24, rows * 12 + 2))
+        for row, n in enumerate(range(top, min(top + rows, len(lines)))):
+            x = 26 - left * cw
+            for piece, color in paint(lines[n]):
+                x += text(piece, x, 20 + row * 12, FM, color) if piece else 0
+        if time.time() % 1 < 0.6:
+            pygame.draw.rect(screen, ACCENT, (26 + (cx - left) * cw, 20 + (cy - top) * 12, 2, 12))
+        screen.set_clip(None)
+        for row, n in enumerate(range(top, min(top + rows, len(lines)))):
+            text(str(n + 1), 20, 20 + row * 12, FM, DIM, right=True)
+        text("Esc save+close   Ctrl+R save+run   Ctrl+Q discard", 4, 156, FS, DIM)
+        flip()
+
+
+def help_modal():
+    """A dismissable cheat sheet (F1). Any key closes it."""
+    lines = ["Home:  1-5 or F/X/Z/C move, Enter open, Esc back",
+             "",
+             "In a project:",
+             "  Tab         next screen: Files+Chat / Models / Runs",
+             "  Fn + Z / C  focus the chat (left) or files (right)",
+             "  Chat focus: type, Enter sends, Fn+F/X scrolls",
+             "  Files focus: Fn+F/X move, Enter edit, R run,",
+             "               N new, D delete, Z up a folder",
+             "  Models:     Enter uses the selected model",
+             "  Runs:       Enter output, K stops a run",
+             "  Esc         leaves the project",
+             "",
+             "F1 shows this help."]
+    while True:
+        for k, u in keys():
+            if k or u:
+                return
+        screen.fill(BG)
+        text("Help", 8, 5, FT)
+        for i, l in enumerate(lines):
+            text(l, 8, 26 + i * 10, FS, DIM if l.startswith("  ") else TEXT)
+        flip(10)
+
+
+def session(folder):
+    """One project: chat (left) and files (right). Fn ←/→ switch the focus, Tab the screen, F1 shows help."""
+    views = ("Files+Chat", "Models", "Runs")
+    SPLIT, MODELS, RUNS = range(3)
+    view, cwd, sel, jsel, msel, up, typed, flash, goto, focus = 0, folder, 0, 0, 0, 0, "", ("", 0), None, "chat"
+    chat_file, busy, stop, last = folder / ".chat.json", [""], threading.Event(), [None, None]  # last: script, job
+    warmed = [None]  # the server process whose prompt state already holds the Code examples
+    try:
+        history = json.loads(chat_file.read_text())
+    except (OSError, ValueError):
+        history = []
+    have = usable(vision=False)
+    tools_note(folder)
+
+    def context():
+        """Enabled notes in .context/: they are pasted into the prompt because the model cannot read files."""
+        return [p for p in sorted((folder / ".context").glob("*")) if p.is_file() and p.suffix != ".off"]
+
+    def work(file):
+        try:
+            if not ensure_server(have[0]):
+                if busy[0]:
+                    history.append({"role": "note", "content": "Could not load the model (too big for the RAM?)"})
+                return
+            state = f"{slug(have[0], 40)}-{CODE_ID}.bin"
+            fresh = warmed[0] is not server  # this server process has not seen the examples yet
+            if fresh and not slot("restore", state):
+                history.append({"role": "note", "content": "First time with this model: about a minute"})
+            busy[0] = "writing"
+            notes = "\n".join(p.read_text(errors="replace")[:4000] for p in context())
+            ran = ""
+            if last[1] and last[1]["proc"].poll() not in (None, 0):  # a failed run: let the model see the error
+                ran = f"Running {last[1]['name']} failed with:\n{''.join(last[1]['out'])[-200:].strip()}"
+            msgs = [m for m in history if m["role"] != "note"][-5:]
+            while msgs[0]["role"] != "user":  # chat templates want the first turn to be the user's
+                msgs.pop(0)
+            ask, reply = msgs[-1]["content"], {"role": "assistant", "content": ""}
+            history.append(reply)
+            for piece in stream(code_prompt(notes, msgs, ran, file), stop, max_tokens=300, temperature=0.1):
+                reply["content"] += piece
+                if reply["content"].count("```") >= 2:  # the script is complete; tiny models ramble after it
+                    break
+            if fresh and not (DATA / "slots" / state).exists():
+                slot("save", state)
+            warmed[0] = server
+            for name, ext, body in extract_scripts(reply["content"])[:1]:
+                path, n = folder / (name or slug(ask) + ext), 2
+                if file:  # the request was about the selected script, so the answer is its new version even
+                    path = file  # when the model renames it (tiny models do). The old version is kept.
+                    (folder / ".history").mkdir(exist_ok=True)
+                    shutil.copy2(path, folder / ".history" / path.name)
+                    verb = "edited"
+                else:     # a new script, named by the model: never overwrite an existing file
+                    while path.exists():
+                        path, n = folder / f"{Path(name or slug(ask)).stem}-{n}{ext}", n + 1
+                    verb = "saved"
+                path.write_text(strip_comments(body))
+                last[0] = path  # the main loop moves the file selection to it
+                history.append({"role": "note", "content": f"{verb} {path.name}  -  Ctrl+R runs it"})
+        except (OSError, ValueError) as e:
+            history.append({"role": "note", "content": f"error: {e}"})
+        finally:
+            busy[0] = ""
+            del history[:-40]
+            chat_file.write_text(json.dumps(history))
+
+    def run(path):
+        stop.set()
+        busy[0] = ""
+        stop_server()  # scripts get the RAM: the model is loaded again on the next message
+        job = launch(path)
+        if not job:
+            return (f"{MAX_RUNNING} runs at once is the limit", time.time() + 2)
+        last[1] = job
+        console(job)
+        return flash
+
+    while True:
+        files = sorted((p for p in cwd.iterdir() if p.name != ".chat.json"), key=lambda p: (p.is_file(), p.name))
+        goto, last[0] = goto or last[0], None
+        if goto in files:  # a file that was just created (by you or by Kesha) gets the selection
+            sel = files.index(goto)
+        goto = None
+        sel, jsel = min(sel, max(0, len(files) - 1)), min(jsel, max(0, len(jobs) - 1))
+        here = files[sel] if files else None
+        for k, u in keys():
+            low = u.lower()
+            if k == pygame.K_F1:
+                help_modal()
+            elif k == pygame.K_TAB:
+                view = (view + 1) % len(views)
+            elif k == pygame.K_ESCAPE:
+                if busy[0] == "writing":
+                    stop.set()
+                elif view == SPLIT and focus == "files" and cwd != folder:
+                    cwd, sel = cwd.parent, 0
+                else:
+                    stop.set()
+                    if busy[0]:
+                        busy[0] = ""
+                        stop_server()
+                    return
+            elif view == MODELS:  # pick the model this project talks to
+                if have:
+                    msel = (msel + step(k, u)) % len(have)
+                    if k == pygame.K_RETURN:
+                        save_config({**load_config(), "model": have[msel]})
+                        have, msel = usable(vision=False), 0  # usable() puts the chosen one first
+            elif view == RUNS:
+                jsel = (jsel + step(k, u)) % max(1, len(jobs))
+                if jobs and k == pygame.K_RETURN:
+                    console(jobs[jsel])
+                elif jobs and low == "k":
+                    kill(jobs[jsel])
+            elif k == pygame.K_LEFT:   # Fn ← focuses the chat, Fn → the files
+                focus = "chat"
+            elif k == pygame.K_RIGHT:
+                focus = "files"
+            elif focus == "files":  # right panel is a normal file menu: letters are commands, Fn arrows / F,X move
+                sel = (sel + step(k, u)) % max(1, len(files))
+                if (low == "z" or k == pygame.K_BACKSPACE) and cwd != folder:
+                    cwd, sel = cwd.parent, 0
+                elif low == "n":
+                    name = ask_line("New file", "Name (ends in .sh or .py)")
+                    if name:
+                        name = name.replace("/", "-")
+                        goto = new = cwd / (name if "." in name or cwd.name == ".context" else name + ".sh")
+                        if edit(new):
+                            flash = run(new)
+                elif here is None:
+                    pass
+                elif k == pygame.K_RETURN and here.is_dir():
+                    cwd, sel = here, 0
+                elif k == pygame.K_RETURN and edit(here):
+                    flash = run(here)
+                elif low == "r" and here.suffix in (".sh", ".py"):
+                    flash = run(here)
+                elif low == "t" and cwd.name == ".context" and here.is_file():
+                    here.rename(here.with_suffix("") if here.suffix == ".off" else here.with_name(here.name + ".off"))
+                elif low == "d" and here.is_file():
+                    if ask_line(f"Delete {here.name}?", "Type y and Enter to delete") == "y":
+                        here.unlink()
+            else:  # focus == "chat": the left panel, type the message
+                if k in (pygame.K_UP, pygame.K_DOWN, pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+                    up = max(0, up + (3 if k in (pygame.K_UP, pygame.K_PAGEUP) else -3))
+                elif k == pygame.K_BACKSPACE:
+                    typed = typed[:-1]
+                elif k == pygame.K_RETURN:
+                    if not have:
+                        flash = ("No chat model: open the Models screen (Tab)", time.time() + 3)
+                    elif typed.strip() and not busy[0]:
+                        history.append({"role": "user", "content": typed.strip()})
+                        typed, up, busy[0] = "", 0, "loading"
+                        stop.clear()
+                        shown = here if here and here.parent == folder and here.stat().st_size <= 1500 \
+                            and refers(history[-1]["content"], here) else None
+                        threading.Thread(target=work, args=(shown,), daemon=True).start()
+                elif u and u.isprintable():
+                    typed += u
+
+        running = sum(j["proc"].poll() is None for j in jobs)
+        code_bar(f"{folder.name} · {views[view]}", have[0] if have else None, busy[0], running)
+        if view == MODELS:
+            cat = catalog()
+            rows = [(m, "in use" if have and m == have[0] else f"{cat[m][1]}MB") for m in have]
+            draw_rows(4, W - 8, rows or [("No chat model — get one in Models", "")], msel if have else None)
+        elif view == RUNS:
+            draw_rows(4, W - 8, [(j["name"], status(j)) for j in jobs] or [("No runs yet", "")], jsel if jobs else None)
+        else:  # SPLIT: chat (left) and files (right); the focused panel gets the accent border
+            cx, cw, fx, fw = 4, 150, 158, 158
+            frows = [(p.name, ("off" if p.suffix == ".off" else "on") if cwd.name == ".context" and p.is_file() else "")
+                     for p in files]
+            draw_rows(fx, fw, frows or [("(empty)", "")], sel if files else None)
+            lines = []
+            for m in history:
+                color = {"user": SOFT, "note": GREEN}.get(m["role"], TEXT)
+                lines += [(l, color) for l in wrap(("> " if m["role"] == "user" else "") + m["content"], cw - 6, True)]
+            if busy[0]:
+                lines.append((("Loading model" if busy[0] == "loading" else "Kesha is coding")
+                              + "." * (int(time.time() * 2) % 4), DIM))
+            if not history and not busy[0]:
+                lines = [(l, DIM) for l in wrap("Ask Kesha for a script.\nFn+Z / Fn+C switch panels. F1 help.",
+                                                cw - 6, True)]
+            bubble = (wrap(typed, cw - 12, True) or [""])[-4:]
+            bh = len(bubble) * 12 + 7
+            by = 166 - bh
+            avail = max(1, (by - 20) // 12)
+            up = min(up, max(0, len(lines) - avail))
+            end = len(lines) - up
+            for i, (line, color) in enumerate(lines[max(0, end - avail):end]):
+                text(line, cx + 2, 20 + i * 12, FS, color)
+            pygame.draw.rect(screen, PANEL, (cx, by, cw, bh), border_radius=6)
+            cur = "_" if focus == "chat" and time.time() % 1 < 0.5 else ""
+            for i, bl in enumerate(bubble):
+                text(bl + (cur if i == len(bubble) - 1 else ""), cx + 5, by + 3 + i * 12, FS,
+                     TEXT if focus == "chat" else DIM)
+            pygame.draw.rect(screen, ACCENT, (cx - 2, 18, cw + 4, 148) if focus == "chat" else (fx - 2, 18, fw + 4, 148),
+                             2, border_radius=6)
+        if flash[1] > time.time():
+            pygame.draw.rect(screen, BG, (0, 150, W, 16))
+            text(flash[0], 6, 152, FS, WARN)
+        flip(15)
+
+
+def code():
+    while True:
+        CODE_ROOT.mkdir(exist_ok=True)
+        folders = sorted(p for p in CODE_ROOT.iterdir() if p.is_dir())
+        rows = [("+ New project", "")] + [(p.name, f"{len([f for f in p.iterdir() if f.is_file()])} files") for p in folders]
+        i, act = pick("Code · projects", rows, "Enter open   D delete   Esc back", actions="d")
+        if i is None:
+            return
+        if i == 0:
+            if act == "d":
+                continue
+            name = slug(ask_line("New project", "Name of the project") or "", 32)
+            if name == "script":  # slug's fallback: nothing usable typed, or cancelled
+                continue
+            (CODE_ROOT / name / ".context").mkdir(parents=True, exist_ok=True)
+            note = CODE_ROOT / name / ".context" / "device.txt"  # editable copy of the device cheat sheet
+            if not note.exists():
+                note.write_text("Useful commands on this device:\n" + (HERE / "device.txt").read_text())
+            session(CODE_ROOT / name)
+        elif act == "d":
+            p = folders[i - 1]
+            if ask_line(f"Delete project {p.name}?", "Type y and Enter — deletes the whole folder") == "y":
+                shutil.rmtree(p, ignore_errors=True)
+        else:
+            session(folders[i - 1])
+
+
+# ---------------------------------------------------------------- settings
+
+BOOT_CONFIG = "/boot/firmware/config.txt"
+# The stock image reserves 128 MB for the GPU, which this device barely uses. Power mode drops it to 16 MB,
+# giving ~112 MB back to the models (a 350M model then runs resident, ~5 tok/s) but disabling the camera.
+# The original line is kept as a "#kesha-llm ..." comment so turning the setting off restores it exactly.
+RAM_ON = (r"grep -q '^gpu_mem=' {f} && sed -i -E 's/^gpu_mem=(.*)$/#kesha-llm gpu_mem=\1\ngpu_mem=16/' {f}"
+          r" || printf '\n[all]\n#kesha-llm\ngpu_mem=16\n' >> {f}")
+RAM_OFF = r"sed -i -E '/^#kesha-llm/{{n;d}}' {f} && sed -i -E 's/^#kesha-llm (gpu_mem=.+)$/\1/;/^#kesha-llm$/d' {f}"
+
+
+def extra_ram_on(path=BOOT_CONFIG):
+    try:
+        return any(line.startswith("#kesha-llm") for line in open(path))
+    except OSError:
+        return False
+
+
+def toggle_extra_ram():
+    script = (RAM_OFF if extra_ram_on() else RAM_ON).format(f=BOOT_CONFIG)
+    password = ""
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode:
+        password = ask_line("Admin password", f"Needed to edit {BOOT_CONFIG}", secret=True)
+        if password is None:
+            return
+    r = subprocess.run(["sudo", "-S", "-p", "", "sh", "-c", script], input=password + "\n", capture_output=True, text=True)
+    if r.returncode:
+        return text_view("Settings", "Could not change the setting.\n\n" + (r.stderr.strip() or "wrong password?"))
+    if text_view("Settings", "Done. It takes effect after a restart.\n\nPress Enter to restart the Cardputer now.",
+                 "Enter restart  Esc later"):
+        subprocess.run(["systemctl", "reboot"])
+
+
+def settings():
+    while True:
+        cfg = load_config()
+        rows = [("Power mode: big AI, no camera (restart)", "ON" if extra_ram_on() else "OFF"),
+                ("Flip camera image", "OFF" if cfg.get("no_flip") else "ON")]
+        i, _ = pick("Settings", rows, "Enter change   Esc back")
+        if i is None:
+            return
+        if i == 0:
+            toggle_extra_ram()
+        else:
+            save_config({**cfg, "no_flip": not cfg.get("no_flip")})
+
+
+# ---------------------------------------------------------------- entry
+
+def selftest():
+    import tempfile
+    events = [b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n', b"\n", b": ping\n",
+              b'data: {"choices":[{"delta":{"content":"Ho"}}]}\n', b'data: {"choices":[{"delta":{"content":"la"}}]}\n',
+              b'data: {"choices":[],"usage":{}}\n', b"data: [DONE]\n"]
+    assert "".join(sse_deltas(events)) == "Hola"
+    assert len(COCO) == 80 and COCO[0] == "person" and COCO[9] == "traffic light" and COCO[79] == "toothbrush", COCO
+    for key, (desc, mb, url) in CATALOG.items():
+        assert url.startswith("https://") and url.endswith((".gguf", ".onnx")) and mb > 0 and desc, key
+    assert summary([("cat", .5, 0, 0, 1, 1), ("dog", .9, 0, 0, 1, 1), ("cat", .7, 0, 0, 1, 1)]) == \
+        [("dog", 1, .9), ("cat", 2, .7)]
+    assert extract_scripts("Sure!\n```sh\necho hi\n```\nand\n```python\n# a.py\nprint(1)\n```") == \
+        [(None, ".sh", "echo hi\n"), ("a.py", ".py", "# a.py\nprint(1)\n")]
+    assert extract_scripts("```sh\n#bat.sh\ndate") == [("bat.sh", ".sh", "#bat.sh\ndate\n")] and extract_scripts("I cannot") == []
+    assert extract_scripts("```sh\n# ../../etc/x.sh\ndate\n```")[0][0] is None          # a path is not a name
+    assert extract_scripts("#!/usr/bin/env python3\nprint(1)") == [(None, ".py", "#!/usr/bin/env python3\nprint(1)\n")]
+    assert extract_scripts("```sh\nimport os\nprint(os.getcwd())\n```")[0][1] == ".py"  # mislabelled block
+    assert extract_scripts("echo hi") == [(None, ".sh", "echo hi\n")]                     # no fence at all
+    notes = "battery percent: cat /b\nwifi networks: nmcli w\nKeep answers short"
+    assert hints("show the battery percent", notes) == ["# battery percent\ncat /b"] and hints("sing", notes) == []
+    prompt = code_prompt(notes, [{"role": "user", "content": "list wifi network"}])
+    task = prompt[-1]["content"]
+    assert task.startswith("Notes:\nKeep answers short\n\nHints:\n") and task.endswith("\n\nTask: list wifi network"), task
+    assert "nmcli w" in task and "nmcli -f SIGNAL,SSID" in task, task  # project note hint + a built-in wifi skill
+    assert strip_comments("# a.sh\nls  # inline stays\n# drop this\necho hi\n") == "# a.sh\nls  # inline stays\necho hi\n"
+    assert strip_comments("#!/bin/sh\n# note\necho hi\n") == "#!/bin/sh\necho hi\n"  # shebang + first line survive
+    assert prompt[0]["role"] == "system" and [m["role"] for m in prompt[1:]] == ["user", "assistant"] * len(CODE_SHOTS) + ["user"]
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write("echo a\n")
+    shown = code_prompt("", [{"role": "user", "content": "say b"}], file=Path(f.name))[-1]["content"]
+    assert shown == f"```sh\n# {Path(f.name).name}\necho a\n```\n\nTask: say b", shown
+    assert refers("make it say b", Path(f.name)) and refers(f"fix {Path(f.name).name}", Path(f.name))
+    assert not refers("show my ip address", Path(f.name))
+    os.unlink(f.name)
+    assert [c for s, c in paint('echo "a # b" 42 # note') if s.strip()] == [SYNTAX_COLORS[3], SYNTAX_COLORS[0],
+                                                                            SYNTAX_COLORS[2], SYNTAX_COLORS[1]]
+    assert "".join(s for s, _ in paint("if x; then y  # z")) == "if x; then y  # z"
+    assert slug("Show me the Battery %!") == "show-me-the-battery" and slug("???") == "script"
+    # the boot-config toggle must restore the original file byte for byte
+    for original in ("a=1\ngpu_mem=128\n[all]\nb=2\n", "a=1\n"):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write(original)
+        assert not extra_ram_on(f.name)
+        subprocess.run(["sh", "-c", RAM_ON.format(f=f.name)], check=True)
+        on = open(f.name).read()
+        assert extra_ram_on(f.name) and "\ngpu_mem=16\n" in on and "gpu_mem=128\n" not in on.replace("#kesha-llm gpu_mem=128", ""), on
+        subprocess.run(["sh", "-c", RAM_OFF.format(f=f.name)], check=True)
+        off = open(f.name).read()
+        assert not extra_ram_on(f.name) and "gpu_mem=16" not in off and off.startswith(original.rstrip("\n")), off
+        os.unlink(f.name)
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    init_ui()
+    for line in wrap("hello tiny wonderful world " + "x" * 400 + "\nend", 100):
+        assert F.size(line)[0] <= 100, line
+    assert wrap("a\nb", 100) == ["a", "b"]
+    print("selftest ok")
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        init_ui()
+        home()

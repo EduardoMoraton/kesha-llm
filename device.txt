@@ -1,0 +1,19 @@
+battery percent: cat /sys/class/power_supply/bq27220-0/capacity
+charging state: cat /sys/class/power_supply/bq27220-0/status
+screen brightness 0-100: echo 50 > /sys/class/backlight/backlight/brightness
+beep: ffplay -nodisp -autoexit -v 0 -f lavfi -i "sine=f=880:d=0.3"
+play sound: pw-play file.wav
+volume 0-1: wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.5
+record 5s of mic: timeout 5 pw-record rec.wav
+take photo: rpicam-still -n -t 1 -o photo.jpg
+send infrared: ir-ctl -d /dev/lirc0 -S nec:0x0408
+receive infrared: ir-ctl -d /dev/lirc1 -r -1
+accelerometer: cat /sys/bus/iio/devices/iio:device0/in_accel_x_raw
+compass: cat /sys/bus/iio/devices/iio:device2/in_magn_x_raw
+wifi networks: nmcli -t -f SSID,SIGNAL dev wifi list
+ip address: hostname -I
+cpu temperature: vcgencmd measure_temp
+memory: free -m
+disk: df -h /
+read gpio pin: gpioget -c gpiochip0 5
+bluetooth scan: bluetoothctl --timeout 5 scan on
